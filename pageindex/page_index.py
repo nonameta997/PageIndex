@@ -28,6 +28,7 @@ PAGE_LOCATION_MAX_ATTEMPTS = 3
 NO_TOC_MAX_TITLE_CHARS = 160
 NO_TOC_MAX_TITLE_WORDS = 24
 NO_TOC_MIN_DOCUMENT_COVERAGE_RATIO = 0.50
+GENERATED_TOC_CORRECTION_MAX_ATTEMPTS = 3
 TOC_APPLICABILITY_PRINTED_NUMBERED = "printed_page_numbered"
 TOC_APPLICABILITY_STRUCTURAL_NUMBERED = "structurally_numbered_without_page_column"
 TOC_APPLICABILITY_UNUSABLE_CANDIDATE = "unusable_detector_candidate"
@@ -1544,9 +1545,10 @@ async def fix_incorrect_toc(toc_with_page_number, page_list, incorrect_results, 
     
     end_index = len(page_list) + start_index - 1
     
-    incorrect_results_and_range_logs = []
+    correction_range_count = 0
     # Helper function to process and check a single incorrect item
     async def process_and_check_item(incorrect_item):
+        nonlocal correction_range_count
         list_index = incorrect_item['list_index']
         
         # Check if list_index is valid
@@ -1583,12 +1585,7 @@ async def fix_incorrect_toc(toc_with_page_number, page_list, incorrect_results, 
         if next_correct is None:
             next_correct = end_index
         
-        incorrect_results_and_range_logs.append({
-            'list_index': list_index,
-            'title': incorrect_item['title'],
-            'prev_correct': prev_correct,
-            'next_correct': next_correct
-        })
+        correction_range_count += 1
 
         page_contents=[]
         for page_index in range(prev_correct, next_correct+1):
@@ -1621,9 +1618,9 @@ async def fix_incorrect_toc(toc_with_page_number, page_list, incorrect_results, 
         for item in incorrect_results
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    for item, result in zip(incorrect_results, results):
+    for result in results:
         if isinstance(result, Exception):
-            print(f"Processing item {item} generated an exception: {result}")
+            print("Generated TOC item correction failed")
             continue
     results = [result for result in results if not isinstance(result, Exception)]
 
@@ -1649,14 +1646,28 @@ async def fix_incorrect_toc(toc_with_page_number, page_list, incorrect_results, 
                 'physical_index': result['physical_index'],
             })
 
-    logger.info(f'incorrect_results_and_range_logs: {incorrect_results_and_range_logs}')
-    logger.info(f'invalid_results: {invalid_results}')
+    logger.info({
+        "mode": "toc_item_correction",
+        "requested_count": len(incorrect_results),
+        "range_count": correction_range_count,
+        "completed_count": len(results),
+        "invalid_count": len(invalid_results),
+    })
 
     return toc_with_page_number, invalid_results
 
 
 
-async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results, start_index=1, max_attempts=3, model=None, logger=None):
+async def fix_incorrect_toc_with_retries(
+    toc_with_page_number,
+    page_list,
+    incorrect_results,
+    start_index=1,
+    max_attempts=3,
+    model=None,
+    logger=None,
+    return_attempts=False,
+):
     print('start fix_incorrect_toc')
     fix_attempt = 0
     current_toc = toc_with_page_number
@@ -1672,7 +1683,174 @@ async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorr
             logger.info("Maximum fix attempts reached")
             break
     
+    if return_attempts:
+        return current_toc, current_incorrect, fix_attempt
     return current_toc, current_incorrect
+
+
+def _generated_page_order_state(items, *, start_index, page_count):
+    """Return a sanitized correction state without changing source ordering."""
+    converted = convert_physical_index_to_int(copy.deepcopy(items))
+    if not isinstance(converted, list) or not converted:
+        raise TocTransformationExhausted(
+            "no_toc_correction", "provider_output_malformed"
+        )
+
+    normalized = []
+    pages = []
+    for item in converted:
+        if not isinstance(item, dict):
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_malformed"
+            )
+        structure = item.get("structure")
+        title = item.get("title")
+        physical_index = item.get("physical_index")
+        try:
+            _structure_key(structure)
+        except TocTransformationExhausted as exc:
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_malformed"
+            ) from exc
+        if not isinstance(title, str) or not title.strip():
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_malformed"
+            )
+        if (
+            not isinstance(physical_index, int)
+            or isinstance(physical_index, bool)
+            or physical_index < start_index
+            or physical_index > start_index + page_count - 1
+        ):
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_malformed"
+            )
+        normalized_item = copy.deepcopy(item)
+        normalized_item["structure"] = structure.strip()
+        normalized_item["title"] = title.strip()
+        normalized_item["physical_index"] = physical_index
+        normalized.append(normalized_item)
+        pages.append(physical_index)
+
+    violation_pairs = [
+        (index - 1, index)
+        for index in range(1, len(pages))
+        if pages[index] < pages[index - 1]
+    ]
+    violation_score = (
+        len(violation_pairs),
+        sum(pages[left] - pages[right] for left, right in violation_pairs),
+    )
+    suspect_indices = sorted(
+        {index for pair in violation_pairs for index in pair}
+    )
+    incorrect_results = [
+        {
+            "list_index": index,
+            "title": normalized[index]["title"],
+            "physical_index": normalized[index]["physical_index"],
+        }
+        for index in suspect_indices
+    ]
+    signature = tuple(
+        (
+            item["structure"],
+            item["title"],
+            item["physical_index"],
+        )
+        for item in normalized
+    )
+    return normalized, incorrect_results, violation_score, signature
+
+
+async def _validate_or_correct_generated_no_toc_candidate(
+    items,
+    page_list,
+    *,
+    start_index,
+    model,
+    logger,
+    max_attempts=GENERATED_TOC_CORRECTION_MAX_ATTEMPTS,
+):
+    """Correct only generated page-order failures under one bounded budget."""
+    current = copy.deepcopy(items)
+    attempts = 0
+    while True:
+        try:
+            validated = _validate_generated_no_toc_candidate(
+                current,
+                start_index=start_index,
+                page_count=len(page_list),
+            )
+            return validated, attempts
+        except TocTransformationExhausted as exc:
+            if not (
+                exc.stage == "toc_validation"
+                and exc.reason_code == "page_out_of_order"
+            ):
+                if attempts:
+                    raise TocTransformationExhausted(
+                        "no_toc_correction", "provider_output_invalid"
+                    ) from exc
+                raise
+
+        if attempts >= max_attempts:
+            raise TocTransformationExhausted(
+                "no_toc_correction", "page_order_correction_exhausted"
+            )
+
+        before, incorrect, violation_score, signature = (
+            _generated_page_order_state(
+                current,
+                start_index=start_index,
+                page_count=len(page_list),
+            )
+        )
+        if not incorrect or violation_score[0] < 1:
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_invalid"
+            )
+
+        correction_result = await fix_incorrect_toc(
+            copy.deepcopy(before),
+            page_list,
+            incorrect,
+            start_index,
+            model,
+            logger,
+        )
+        attempts += 1
+        if not isinstance(correction_result, tuple) or len(correction_result) != 2:
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_malformed"
+            )
+        candidate, _remaining = correction_result
+        after, _incorrect, after_score, after_signature = (
+            _generated_page_order_state(
+                candidate,
+                start_index=start_index,
+                page_count=len(page_list),
+            )
+        )
+        if tuple(item[:2] for item in after_signature) != tuple(
+            item[:2] for item in signature
+        ):
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_changed_structure"
+            )
+        if after_score > violation_score:
+            raise TocTransformationExhausted(
+                "no_toc_correction", "provider_output_worsened"
+            )
+        logger.info({
+            "mode": "generated_toc_page_order_correction",
+            "attempt": attempts,
+            "requested_count": len(incorrect),
+            "remaining_violation_count": after_score[0],
+            "remaining_violation_depth": after_score[1],
+            "changed": after_signature != signature,
+        })
+        current = after
 
 
 
@@ -1749,6 +1927,7 @@ async def meta_processor(
 ):
     print(mode)
     print(f'start_index: {start_index}')
+    generated_correction_attempts = 0
 
     if (
         mode == 'process_toc_with_page_numbers'
@@ -1787,10 +1966,15 @@ async def meta_processor(
         toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
             
     if mode == 'process_no_toc':
-        toc_with_page_number = _validate_generated_no_toc_candidate(
+        (
             toc_with_page_number,
+            generated_correction_attempts,
+        ) = await _validate_or_correct_generated_no_toc_candidate(
+            toc_with_page_number,
+            page_list,
             start_index=start_index,
-            page_count=len(page_list),
+            model=opt.model,
+            logger=logger,
         )
     else:
         toc_with_page_number = _validate_toc_sequence(
@@ -1812,7 +1996,8 @@ async def meta_processor(
     logger.info({
         'mode': mode,
         'accuracy': accuracy,
-        'incorrect_results': incorrect_results
+        'incorrect_count': len(incorrect_results),
+        'generated_correction_attempts': generated_correction_attempts,
     })
     if accuracy == 1.0 and len(incorrect_results) == 0:
         if mode == 'process_no_toc':
@@ -1828,8 +2013,35 @@ async def meta_processor(
             min_page=start_index,
             max_page=start_index + len(page_list) - 1,
         )
-    if accuracy > 0.6 and len(incorrect_results) > 0:
-        toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results,start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
+    remaining_correction_attempts = (
+        GENERATED_TOC_CORRECTION_MAX_ATTEMPTS - generated_correction_attempts
+        if mode == 'process_no_toc'
+        else GENERATED_TOC_CORRECTION_MAX_ATTEMPTS
+    )
+    if (
+        accuracy > 0.6
+        and len(incorrect_results) > 0
+        and remaining_correction_attempts > 0
+    ):
+        correction_result = await fix_incorrect_toc_with_retries(
+            toc_with_page_number,
+            page_list,
+            incorrect_results,
+            start_index=start_index,
+            max_attempts=remaining_correction_attempts,
+            model=opt.model,
+            logger=logger,
+            return_attempts=mode == 'process_no_toc',
+        )
+        if mode == 'process_no_toc':
+            (
+                toc_with_page_number,
+                incorrect_results,
+                used_attempts,
+            ) = correction_result
+            generated_correction_attempts += used_attempts
+        else:
+            toc_with_page_number, incorrect_results = correction_result
         if mode == 'process_no_toc':
             toc_with_page_number = _validate_generated_no_toc_candidate(
                 toc_with_page_number,

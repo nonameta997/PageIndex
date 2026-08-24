@@ -1,11 +1,13 @@
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from pageindex.page_index import (
+    GENERATED_TOC_CORRECTION_MAX_ATTEMPTS,
     LARGE_NUMBERED_TOC_MIN_ENTRIES,
     NO_TOC_MAX_TITLE_CHARS,
     NO_TOC_MAX_TITLE_WORDS,
@@ -25,9 +27,10 @@ from pageindex.page_index import (
     _map_structural_toc_to_pages,
     _numbered_toc_entries,
     _transform_structural_numbered_toc,
-    _validate_printed_mapping_output,
     _validate_generated_no_toc_candidate,
     _validate_numbered_toc_chunk,
+    _validate_or_correct_generated_no_toc_candidate,
+    _validate_printed_mapping_output,
     _validate_toc_sequence,
     calculate_page_offset,
     classify_toc_candidate,
@@ -827,6 +830,237 @@ def test_generated_no_toc_publication_quality_rejects_pathologies(
             page_count=page_count,
         )
     assert caught.value.reason_code == reason
+
+
+def _generated_page_order_failure():
+    return [
+        {"structure": "1", "title": "One", "physical_index": 1},
+        {"structure": "2", "title": "Two", "physical_index": 4},
+        {"structure": "3", "title": "Three", "physical_index": 3},
+        {"structure": "4", "title": "Four", "physical_index": 6},
+    ]
+
+
+def _generated_page_order_correction():
+    return [
+        {"structure": "1", "title": "One", "physical_index": 1},
+        {"structure": "2", "title": "Two", "physical_index": 2},
+        {"structure": "3", "title": "Three", "physical_index": 3},
+        {"structure": "4", "title": "Four", "physical_index": 6},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generated_page_out_of_order_enters_bounded_correction_and_verifies():
+    original = _generated_page_order_failure()
+    corrected = _generated_page_order_correction()
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    opt = SimpleNamespace(model="test", toc_check_page_num=6)
+    fixer = AsyncMock(return_value=(corrected, []))
+    verifier = AsyncMock(return_value=(1.0, []))
+    with (
+        patch("pageindex.page_index.process_no_toc", return_value=original),
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        patch("pageindex.page_index.verify_toc", verifier),
+    ):
+        result = await meta_processor(
+            [("body", 1)] * 6,
+            mode="process_no_toc",
+            start_index=1,
+            opt=opt,
+            logger=logger,
+            toc_applicability=TOC_APPLICABILITY_NONE,
+        )
+
+    assert result == corrected
+    assert fixer.await_count == 1
+    verifier.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_correction_cannot_bypass_full_verification():
+    original = _generated_page_order_failure()
+    corrected = _generated_page_order_correction()
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    opt = SimpleNamespace(model="test", toc_check_page_num=6)
+    fixer = AsyncMock(return_value=(corrected, []))
+    verifier = AsyncMock(return_value=(0.99, []))
+    with (
+        patch("pageindex.page_index.process_no_toc", return_value=original),
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        patch("pageindex.page_index.verify_toc", verifier),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await meta_processor(
+            [("body", 1)] * 6,
+            mode="process_no_toc",
+            start_index=1,
+            opt=opt,
+            logger=logger,
+            toc_applicability=TOC_APPLICABILITY_NONE,
+        )
+
+    assert caught.value.stage == "toc_quality"
+    assert caught.value.reason_code == "whole_tree_verification_failed"
+    assert fixer.await_count == 1
+    verifier.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_malformed_correction_fails_typed():
+    fixer = AsyncMock(return_value=("not-a-tree", []))
+    with (
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await _validate_or_correct_generated_no_toc_candidate(
+            _generated_page_order_failure(),
+            [("body", 1)] * 6,
+            start_index=1,
+            model="test",
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+
+    assert caught.value.stage == "no_toc_correction"
+    assert caught.value.reason_code == "provider_output_malformed"
+    assert fixer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_correction_cannot_change_source_structure():
+    changed = _generated_page_order_correction()
+    changed[1]["title"] = "Rewritten"
+    fixer = AsyncMock(return_value=(changed, []))
+    with (
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await _validate_or_correct_generated_no_toc_candidate(
+            _generated_page_order_failure(),
+            [("body", 1)] * 6,
+            start_index=1,
+            model="test",
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+
+    assert caught.value.stage == "no_toc_correction"
+    assert caught.value.reason_code == "provider_changed_structure"
+    assert fixer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_unchanged_correction_exhausts_at_three():
+    original = _generated_page_order_failure()
+    fixer = AsyncMock(side_effect=lambda *_args: (copy.deepcopy(original), []))
+    with (
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await _validate_or_correct_generated_no_toc_candidate(
+            original,
+            [("body", 1)] * 6,
+            start_index=1,
+            model="test",
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+
+    assert caught.value.stage == "no_toc_correction"
+    assert caught.value.reason_code == "page_order_correction_exhausted"
+    assert fixer.await_count == GENERATED_TOC_CORRECTION_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_worsening_correction_fails_immediately():
+    worsening = [
+        {"structure": "1", "title": "One", "physical_index": 1},
+        {"structure": "2", "title": "Two", "physical_index": 6},
+        {"structure": "3", "title": "Three", "physical_index": 3},
+        {"structure": "4", "title": "Four", "physical_index": 6},
+    ]
+    fixer = AsyncMock(return_value=(worsening, []))
+    with (
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await _validate_or_correct_generated_no_toc_candidate(
+            _generated_page_order_failure(),
+            [("body", 1)] * 6,
+            start_index=1,
+            model="test",
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+
+    assert caught.value.stage == "no_toc_correction"
+    assert caught.value.reason_code == "provider_output_worsened"
+    assert fixer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generated_page_order_changing_but_invalid_correction_exhausts():
+    residual_candidates = [
+        [2, 4, 3, 6],
+        [2, 5, 4, 6],
+        [3, 5, 4, 6],
+    ]
+    responses = []
+    for pages in residual_candidates:
+        candidate = copy.deepcopy(_generated_page_order_failure())
+        for item, page in zip(candidate, pages):
+            item["physical_index"] = page
+        responses.append((candidate, []))
+    fixer = AsyncMock(side_effect=responses)
+    with (
+        patch("pageindex.page_index.fix_incorrect_toc", fixer),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await _validate_or_correct_generated_no_toc_candidate(
+            _generated_page_order_failure(),
+            [("body", 1)] * 6,
+            start_index=1,
+            model="test",
+            logger=SimpleNamespace(info=lambda *_args, **_kwargs: None),
+        )
+
+    assert caught.value.stage == "no_toc_correction"
+    assert caught.value.reason_code == "page_order_correction_exhausted"
+    assert fixer.await_count == GENERATED_TOC_CORRECTION_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_generated_prevalidation_and_verify_share_one_correction_budget():
+    original = _generated_page_order_failure()
+    corrected = _generated_page_order_correction()
+    verification_incorrect = [
+        {"list_index": 3, "title": "Four", "physical_index": 6}
+    ]
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    opt = SimpleNamespace(model="test", toc_check_page_num=6)
+    prevalidation_fixer = AsyncMock(return_value=(corrected, []))
+    verification_fixer = AsyncMock(return_value=(corrected, [], 1))
+    verifier = AsyncMock(side_effect=[(0.75, verification_incorrect), (1.0, [])])
+    with (
+        patch("pageindex.page_index.process_no_toc", return_value=original),
+        patch("pageindex.page_index.fix_incorrect_toc", prevalidation_fixer),
+        patch(
+            "pageindex.page_index.fix_incorrect_toc_with_retries",
+            verification_fixer,
+        ),
+        patch("pageindex.page_index.verify_toc", verifier),
+    ):
+        result = await meta_processor(
+            [("body", 1)] * 6,
+            mode="process_no_toc",
+            start_index=1,
+            opt=opt,
+            logger=logger,
+            toc_applicability=TOC_APPLICABILITY_NONE,
+        )
+
+    assert result == corrected
+    assert prevalidation_fixer.await_count == 1
+    assert verification_fixer.await_count == 1
+    assert verification_fixer.await_args.kwargs["max_attempts"] == 2
+    assert verifier.await_count == 2
 
 
 @pytest.mark.asyncio
