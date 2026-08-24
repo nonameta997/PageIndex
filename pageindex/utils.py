@@ -29,18 +29,27 @@ def count_tokens(text, model=None):
     return litellm.token_counter(model=model, text=text)
 
 
-def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
+def llm_completion(
+    model,
+    prompt,
+    chat_history=None,
+    return_finish_reason=False,
+    max_retries=10,
+    max_tokens=None,
+):
     if model:
         model = model.removeprefix("litellm/")
-    max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
         try:
-            response = litellm.completion(
+            completion_kwargs = dict(
                 model=model,
                 messages=messages,
                 temperature=0,
             )
+            if max_tokens is not None:
+                completion_kwargs["max_tokens"] = max_tokens
+            response = litellm.completion(**completion_kwargs)
             content = response.choices[0].message.content
             if return_finish_reason:
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
@@ -707,4 +716,3 @@ def print_tree(tree, indent=0):
 def print_wrapped(text, width=100):
     for line in text.splitlines():
         print(textwrap.fill(line, width=width))
-

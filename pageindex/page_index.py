@@ -5,8 +5,471 @@ import math
 import random
 import re
 from .utils import *
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+TOC_CONTINUATION_MAX_ATTEMPTS = 5
+LARGE_NUMBERED_TOC_MIN_ENTRIES = 96
+NUMBERED_TOC_CHUNK_MAX_ENTRIES = 48
+NUMBERED_TOC_CHUNK_MAX_CHARS = 12000
+NUMBERED_TOC_AGGREGATE_MAX_ENTRIES = 512
+NUMBERED_TOC_AGGREGATE_MAX_CHARS = 120000
+TOC_OFFSET_MIN_INDEPENDENT_MATCHES = 3
+TOC_OFFSET_MIN_AGREEMENT_RATIO = 0.75
+TOC_OFFSET_MAX_RESIDUAL = 1
+STRUCTURAL_TOC_MIN_ENTRIES = 24
+STRUCTURAL_TOC_MIN_COVERAGE_RATIO = 0.90
+PAGE_LOCATION_MAX_STRUCTURE_ENTRIES = 48
+PAGE_LOCATION_MAX_STRUCTURE_CHARS = 12000
+PAGE_LOCATION_MAX_PAGE_GROUP_TOKENS = 12000
+PAGE_LOCATION_MAX_PAGE_GROUPS = 16
+PAGE_LOCATION_MAX_OUTPUT_TOKENS = 6000
+PAGE_LOCATION_MAX_ATTEMPTS = 3
+NO_TOC_MAX_TITLE_CHARS = 160
+NO_TOC_MAX_TITLE_WORDS = 24
+NO_TOC_MIN_DOCUMENT_COVERAGE_RATIO = 0.50
+TOC_APPLICABILITY_PRINTED_NUMBERED = "printed_page_numbered"
+TOC_APPLICABILITY_STRUCTURAL_NUMBERED = "structurally_numbered_without_page_column"
+TOC_APPLICABILITY_UNUSABLE_CANDIDATE = "unusable_detector_candidate"
+TOC_APPLICABILITY_NONE = "no_toc"
+_NUMBERED_TOC_START = re.compile(
+    r"^\s*(?P<structure>\d+(?:\.\d+)*)(?:[.)])?\s+(?P<body>\S.*)$"
+)
+_NUMBERED_TOC_PAGE = re.compile(
+    r"^(?P<title>.+?)\s*(?:\.{2,}|…+|:{1,}|-{2,}|\t+)\s*"
+    r"(?P<page>\d+)\s*$"
+)
+
+
+class TocTransformationExhausted(RuntimeError):
+    """A deterministic TOC transformation or quality gate was exhausted."""
+
+    def __init__(self, stage, reason):
+        self.stage = stage
+        self.reason_code = reason
+        super().__init__(f"{stage}: {reason}")
+
+
+def _structure_key(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d+(?:\.\d+)*", value):
+        raise TocTransformationExhausted("toc_validation", "invalid_structure")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _validate_toc_sequence(
+    items,
+    *,
+    page_field="page",
+    require_pages=False,
+    min_page=None,
+    max_page=None,
+    validation_state=None,
+    return_state=False,
+):
+    if not isinstance(items, list) or not items:
+        raise TocTransformationExhausted("toc_validation", "empty_result")
+
+    state = validation_state or {}
+    seen = set(state.get("seen", ()))
+    previous_structure = state.get("previous_structure")
+    previous_page = state.get("previous_page")
+    normalized = []
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            raise TocTransformationExhausted("toc_validation", "invalid_item")
+        structure = str(raw_item.get("structure") or "").strip()
+        structure_key = _structure_key(structure)
+        if structure in seen:
+            raise TocTransformationExhausted("toc_validation", "duplicate_structure")
+        if previous_structure is not None and structure_key <= previous_structure:
+            raise TocTransformationExhausted("toc_validation", "structure_out_of_order")
+        if len(structure_key) > 1:
+            parent = ".".join(str(part) for part in structure_key[:-1])
+            if parent not in seen:
+                raise TocTransformationExhausted("toc_validation", "missing_parent")
+
+        title = str(raw_item.get("title") or "").strip()
+        if not title:
+            raise TocTransformationExhausted("toc_validation", "empty_title")
+
+        page = raw_item.get(page_field) if page_field is not None else None
+        if isinstance(page, str) and page.isdigit():
+            page = int(page)
+        if require_pages and (not isinstance(page, int) or isinstance(page, bool)):
+            raise TocTransformationExhausted("toc_validation", "missing_page")
+        if isinstance(page, int) and not isinstance(page, bool):
+            if min_page is not None and page < min_page:
+                raise TocTransformationExhausted("toc_validation", "page_below_bounds")
+            if max_page is not None and page > max_page:
+                raise TocTransformationExhausted("toc_validation", "page_above_bounds")
+            if previous_page is not None and page < previous_page:
+                raise TocTransformationExhausted("toc_validation", "page_out_of_order")
+            previous_page = page
+        elif page is not None:
+            raise TocTransformationExhausted("toc_validation", "invalid_page")
+
+        item = copy.deepcopy(raw_item)
+        item["structure"] = structure
+        item["title"] = title
+        if page_field is not None:
+            item[page_field] = page
+        normalized.append(item)
+        seen.add(structure)
+        previous_structure = structure_key
+    next_state = {
+        "seen": seen,
+        "previous_structure": previous_structure,
+        "previous_page": previous_page,
+    }
+    if return_state:
+        return normalized, next_state
+    return normalized
+
+
+def _has_numbered_toc_structure(toc_content):
+    return any(
+        _NUMBERED_TOC_START.match(line.strip())
+        for line in str(toc_content or "").splitlines()
+        if line.strip()
+    )
+
+
+def _structural_toc_entries(toc_content):
+    lines = [
+        line.strip()
+        for line in str(toc_content or "").splitlines()
+        if line.strip()
+    ]
+    blocks = []
+    current = None
+    covered_lines = 0
+    for line in lines:
+        match = _NUMBERED_TOC_START.match(line)
+        if match:
+            if current is not None:
+                blocks.append(current)
+            current = [match.group("structure"), match.group("body")]
+            covered_lines += 1
+        elif current is not None:
+            current[1] += " " + line
+            covered_lines += 1
+    if current is not None:
+        blocks.append(current)
+
+    entries = []
+    for structure, body in blocks:
+        printed_page = _NUMBERED_TOC_PAGE.match(body)
+        title = printed_page.group("title") if printed_page else body
+        title = " ".join(title.split())
+        if title:
+            entries.append({"structure": structure, "title": title})
+    coverage_ratio = covered_lines / len(lines) if lines else 0.0
+    return entries, {
+        "source_line_count": len(lines),
+        "covered_line_count": covered_lines,
+        "coverage_ratio": coverage_ratio,
+    }
+
+
+def _numbered_toc_entries(toc_content):
+    blocks = []
+    current = None
+    for raw_line in str(toc_content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _NUMBERED_TOC_START.match(line)
+        if match:
+            if current is not None:
+                blocks.append(current)
+            current = [match.group("structure"), match.group("body")]
+        elif current is not None:
+            current[1] += " " + line
+    if current is not None:
+        blocks.append(current)
+
+    entries = []
+    for structure, body in blocks:
+        page_match = _NUMBERED_TOC_PAGE.match(body)
+        if not page_match:
+            return []
+        entries.append(
+            {
+                "structure": structure,
+                "title": page_match.group("title").strip(),
+                "page": int(page_match.group("page")),
+            }
+        )
+    return entries
+
+
+def classify_toc_candidate(toc_content, page_index_given_in_toc="no"):
+    """Classify provider-detected text using deterministic, sanitized gates."""
+    content = str(toc_content or "")
+    if not content.strip():
+        return TOC_APPLICABILITY_NONE, {
+            "source_line_count": 0,
+            "printed_entry_count": 0,
+            "structural_entry_count": 0,
+            "structural_coverage_ratio": 0.0,
+            "candidate_rejection_reason": None,
+        }
+
+    structural_entries, structural_metrics = _structural_toc_entries(content)
+    metrics = {
+        "source_line_count": structural_metrics["source_line_count"],
+        "printed_entry_count": 0,
+        "structural_entry_count": len(structural_entries),
+        "structural_coverage_ratio": structural_metrics["coverage_ratio"],
+        "reported_page_index": page_index_given_in_toc == "yes",
+        "candidate_rejection_reason": None,
+    }
+
+    printed_entries = _numbered_toc_entries(content)
+    metrics["printed_entry_count"] = len(printed_entries)
+    if printed_entries:
+        try:
+            _merge_numbered_toc_chunks(_chunk_numbered_toc(printed_entries))
+        except TocTransformationExhausted as exc:
+            metrics["candidate_rejection_reason"] = exc.reason_code
+        else:
+            return TOC_APPLICABILITY_PRINTED_NUMBERED, metrics
+
+    if _has_numbered_toc_structure(content):
+        try:
+            _transform_structural_numbered_toc(content)
+        except TocTransformationExhausted as exc:
+            metrics["candidate_rejection_reason"] = exc.reason_code
+        else:
+            return TOC_APPLICABILITY_STRUCTURAL_NUMBERED, metrics
+
+    if metrics["candidate_rejection_reason"] is None:
+        metrics["candidate_rejection_reason"] = "no_usable_numbered_structure"
+    return TOC_APPLICABILITY_UNUSABLE_CANDIDATE, metrics
+
+
+def classify_toc_applicability(toc_content, page_index_given_in_toc="no"):
+    applicability, _metrics = classify_toc_candidate(
+        toc_content,
+        page_index_given_in_toc,
+    )
+    return applicability
+
+
+def _chunk_numbered_toc(entries):
+    if len(entries) > NUMBERED_TOC_AGGREGATE_MAX_ENTRIES:
+        raise TocTransformationExhausted("toc_chunk", "aggregate_entry_limit")
+    aggregate_chars = sum(
+        len(item["structure"]) + len(item["title"]) + 24 for item in entries
+    )
+    if aggregate_chars > NUMBERED_TOC_AGGREGATE_MAX_CHARS:
+        raise TocTransformationExhausted("toc_chunk", "aggregate_character_limit")
+
+    chunks = []
+    chunk = []
+    chunk_chars = 0
+    for item in entries:
+        item_chars = len(item["structure"]) + len(item["title"]) + 24
+        if item_chars > NUMBERED_TOC_CHUNK_MAX_CHARS:
+            raise TocTransformationExhausted("toc_chunk", "entry_too_large")
+        if chunk and (
+            len(chunk) >= NUMBERED_TOC_CHUNK_MAX_ENTRIES
+            or chunk_chars + item_chars > NUMBERED_TOC_CHUNK_MAX_CHARS
+        ):
+            chunks.append(chunk)
+            chunk = []
+            chunk_chars = 0
+        chunk.append(copy.deepcopy(item))
+        chunk_chars += item_chars
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
+def _validate_numbered_toc_chunk(chunk, validation_state=None):
+    return _validate_toc_sequence(
+        chunk,
+        require_pages=True,
+        min_page=1,
+        validation_state=validation_state,
+        return_state=True,
+    )
+
+
+def _validate_structural_toc_chunk(chunk, validation_state=None):
+    return _validate_toc_sequence(
+        chunk,
+        page_field=None,
+        validation_state=validation_state,
+        return_state=True,
+    )
+
+
+def _merge_numbered_toc_chunks(chunks):
+    merged = []
+    validation_state = None
+    for chunk in chunks:
+        normalized, validation_state = _validate_numbered_toc_chunk(
+            chunk,
+            validation_state,
+        )
+        merged.extend(normalized)
+    return merged
+
+
+def _merge_structural_toc_chunks(chunks):
+    merged = []
+    validation_state = None
+    for chunk in chunks:
+        normalized, validation_state = _validate_structural_toc_chunk(
+            chunk,
+            validation_state,
+        )
+        merged.extend(normalized)
+    return merged
+
+
+def _transform_large_numbered_toc(toc_content):
+    entries = _numbered_toc_entries(toc_content)
+    if len(entries) < LARGE_NUMBERED_TOC_MIN_ENTRIES:
+        return None
+    chunks = _chunk_numbered_toc(entries)
+    return _merge_numbered_toc_chunks(chunks)
+
+
+def _transform_structural_numbered_toc(toc_content):
+    entries, metrics = _structural_toc_entries(toc_content)
+    if len(entries) < STRUCTURAL_TOC_MIN_ENTRIES:
+        raise TocTransformationExhausted(
+            "toc_structure", "insufficient_structural_entries"
+        )
+    if metrics["coverage_ratio"] < STRUCTURAL_TOC_MIN_COVERAGE_RATIO:
+        raise TocTransformationExhausted(
+            "toc_structure", "structural_coverage_below_threshold"
+        )
+    chunks = _chunk_numbered_toc(entries)
+    return _merge_structural_toc_chunks(chunks), metrics, chunks
+
+
+def _validate_generated_no_toc_candidate(
+    items,
+    *,
+    start_index,
+    page_count,
+):
+    """Fail closed before generated no-TOC output can become a stored tree."""
+    if page_count < 1:
+        raise TocTransformationExhausted("no_toc_quality", "empty_document")
+
+    normalized = _validate_toc_sequence(
+        convert_physical_index_to_int(items),
+        page_field="physical_index",
+        require_pages=True,
+        min_page=start_index,
+        max_page=start_index + page_count - 1,
+    )
+    triples = set()
+    evidence_projections = set()
+    sibling_pages = set()
+    for item in normalized:
+        title = " ".join(item["title"].split())
+        words = title.split()
+        if len(title) > NO_TOC_MAX_TITLE_CHARS:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "title_character_limit"
+            )
+        if len(words) > NO_TOC_MAX_TITLE_WORDS:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "title_word_limit"
+            )
+        if "\n" in item["title"] or "\r" in item["title"]:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "multiline_title"
+            )
+
+        normalized_title = title.casefold()
+        triple = (
+            item["structure"],
+            normalized_title,
+            item["physical_index"],
+        )
+        if triple in triples:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "duplicate_structure_title_page"
+            )
+        triples.add(triple)
+
+        evidence_projection = (normalized_title, item["physical_index"])
+        if evidence_projection in evidence_projections:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "duplicate_title_page_projection"
+            )
+        evidence_projections.add(evidence_projection)
+
+        parent = item["structure"].rpartition(".")[0]
+        sibling_page = (parent, item["physical_index"])
+        if sibling_page in sibling_pages:
+            raise TocTransformationExhausted(
+                "no_toc_quality", "indistinguishable_same_page_siblings"
+            )
+        sibling_pages.add(sibling_page)
+
+    minimum_last_page = start_index + math.ceil(
+        page_count * NO_TOC_MIN_DOCUMENT_COVERAGE_RATIO
+    ) - 1
+    if normalized[-1]["physical_index"] < minimum_last_page:
+        raise TocTransformationExhausted(
+            "no_toc_quality", "insufficient_document_coverage"
+        )
+    return normalized
+
+
+def _validate_published_tree_shape(nodes, *, start_index, page_count):
+    """Validate the existing stored tree/citation fields without changing shape."""
+    maximum_page = start_index + page_count - 1
+    seen = set()
+
+    def visit(items):
+        if not isinstance(items, list) or not items:
+            raise TocTransformationExhausted(
+                "tree_publication", "empty_published_tree"
+            )
+        for node in items:
+            if not isinstance(node, dict):
+                raise TocTransformationExhausted(
+                    "tree_publication", "invalid_published_node"
+                )
+            title = node.get("title")
+            node_start = node.get("start_index")
+            node_end = node.get("end_index")
+            if not isinstance(title, str) or not title.strip():
+                raise TocTransformationExhausted(
+                    "tree_publication", "invalid_published_title"
+                )
+            if (
+                not isinstance(node_start, int)
+                or isinstance(node_start, bool)
+                or not isinstance(node_end, int)
+                or isinstance(node_end, bool)
+                or node_start < start_index
+                or node_end > maximum_page
+                or node_start > node_end
+            ):
+                raise TocTransformationExhausted(
+                    "tree_publication", "invalid_published_page_range"
+                )
+            projection = (" ".join(title.casefold().split()), node_start, node_end)
+            if projection in seen:
+                raise TocTransformationExhausted(
+                    "tree_publication", "duplicate_published_projection"
+                )
+            seen.add(projection)
+            children = node.get("nodes")
+            if children is not None:
+                visit(children)
+
+    visit(nodes)
+    return nodes
 
 
 ################### check title in page #########################################################
@@ -117,9 +580,8 @@ def toc_detector_single_page(content, model=None):
     Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
 
     response = llm_completion(model=model, prompt=prompt)
-    # print('response', response)
     json_content = extract_json(response)    
-    return json_content['toc_detected']
+    return json_content.get('toc_detected', 'no')
 
 
 def check_if_toc_extraction_is_complete(content, toc, model=None):
@@ -137,7 +599,7 @@ def check_if_toc_extraction_is_complete(content, toc, model=None):
     prompt = prompt + '\n Document:\n' + content + '\n Table of contents:\n' + toc
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
-    return json_content['completed']
+    return json_content.get('completed', 'no')
 
 
 def check_if_toc_transformation_is_complete(content, toc, model=None):
@@ -155,7 +617,7 @@ def check_if_toc_transformation_is_complete(content, toc, model=None):
     prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
-    return json_content['completed']
+    return json_content.get('completed', 'no')
 
 def extract_toc_content(content, model=None):
     prompt = f"""
@@ -175,27 +637,17 @@ def extract_toc_content(content, model=None):
         {"role": "user", "content": prompt}, 
         {"role": "assistant", "content": response},    
     ]
-    prompt = f"""please continue the generation of table of contents , directly output the remaining part of the structure"""
-    new_response, finish_reason = llm_completion(model=model, prompt=prompt, chat_history=chat_history, return_finish_reason=True)
-    response = response + new_response
-    if_complete = check_if_toc_transformation_is_complete(content, response, model)
-    
-    attempt = 0
-    max_attempts = 5
-
-    while not (if_complete == "yes" and finish_reason == "finished"):
-        attempt += 1
-        if attempt > max_attempts:
-            raise Exception('Failed to complete table of contents after maximum retries')
-
-        chat_history = [
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": response},
-        ]
-        prompt = f"""please continue the generation of table of contents , directly output the remaining part of the structure"""
-        new_response, finish_reason = llm_completion(model=model, prompt=prompt, chat_history=chat_history, return_finish_reason=True)
+    continue_prompt = "please continue the generation of table of contents, directly output the remaining part of the structure"
+    for _attempt in range(TOC_CONTINUATION_MAX_ATTEMPTS):
+        new_response, finish_reason = llm_completion(model=model, prompt=continue_prompt, chat_history=chat_history, return_finish_reason=True)
         response = response + new_response
+        chat_history.append({"role": "user", "content": continue_prompt})
+        chat_history.append({"role": "assistant", "content": new_response})
         if_complete = check_if_toc_transformation_is_complete(content, response, model)
+        if if_complete == "yes" and finish_reason == "finished":
+            break
+    else:
+        raise TocTransformationExhausted("toc_extraction", "continuation_exhausted")
     
     return response
 
@@ -217,7 +669,7 @@ def detect_page_index(toc_content, model=None):
 
     response = llm_completion(model=model, prompt=prompt)
     json_content = extract_json(response)
-    return json_content['page_index_given_in_toc']
+    return json_content.get('page_index_given_in_toc', 'no')
 
 def toc_extractor(page_list, toc_page_list, model):
     def transform_dots_to_colon(text):
@@ -270,8 +722,15 @@ def toc_index_extractor(toc, content, model=None):
 
 
 
-def toc_transformer(toc_content, model=None):
+def toc_transformer(toc_content, model=None, trusted_page_index=False):
     print('start toc_transformer')
+    deterministic = (
+        _transform_large_numbered_toc(toc_content)
+        if trusted_page_index
+        else None
+    )
+    if deterministic is not None:
+        return deterministic
     init_prompt = """
     You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
 
@@ -296,44 +755,42 @@ def toc_transformer(toc_content, model=None):
     if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
     if if_complete == "yes" and finish_reason == "finished":
         last_complete = extract_json(last_complete)
-        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-        return cleaned_response
+        cleaned_response = convert_page_to_int(last_complete.get('table_of_contents', []))
+        return _validate_toc_sequence(cleaned_response)
     
     last_complete = get_json_content(last_complete)
-    attempt = 0
-    max_attempts = 5
-    while not (if_complete == "yes" and finish_reason == "finished"):
-        attempt += 1
-        if attempt > max_attempts:
-            raise Exception('Failed to complete toc transformation after maximum retries')
-        position = last_complete.rfind('}')
-        if position != -1:
-            last_complete = last_complete[:position+2]
-        prompt = f"""
-        Your task is to continue the table of contents json structure, directly output the remaining part of the json structure.
-        The response should be in the following JSON format: 
+    chat_history = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": last_complete},
+    ]
+    continue_prompt = "Please continue the table of contents JSON structure from where you left off. Directly output only the remaining part."
+    position = last_complete.rfind('}')
+    if position != -1:
+        last_complete = last_complete[:position+2]
 
-        The raw table of contents json structure is:
-        {toc_content}
-
-        The incomplete transformed table of contents json structure is:
-        {last_complete}
-
-        Please continue the json structure, directly output the remaining part of the json structure."""
-
-        new_complete, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
+    for _attempt in range(TOC_CONTINUATION_MAX_ATTEMPTS):
+        new_complete, finish_reason = llm_completion(
+            model=model,
+            prompt=continue_prompt,
+            chat_history=chat_history,
+            return_finish_reason=True,
+        )
 
         if new_complete.startswith('```json'):
-            new_complete =  get_json_content(new_complete)
-            last_complete = last_complete+new_complete
+            new_complete = get_json_content(new_complete)
+        last_complete = last_complete + new_complete
+        chat_history.append({"role": "user", "content": continue_prompt})
+        chat_history.append({"role": "assistant", "content": new_complete})
 
         if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
-        
+        if if_complete == "yes" and finish_reason == "finished":
+            break
+    else:
+        raise TocTransformationExhausted("toc_transformer", "continuation_exhausted")
 
     last_complete = extract_json(last_complete)
-
-    cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-    return cleaned_response
+    cleaned_response = convert_page_to_int(last_complete.get('table_of_contents', []))
+    return _validate_toc_sequence(cleaned_response)
     
 
 
@@ -391,27 +848,69 @@ def extract_matching_page_pairs(toc_page, toc_physical_index, start_page_index):
     return pairs
 
 
-def calculate_page_offset(pairs):
-    differences = []
+def page_offset_quality_metrics(pairs):
+    candidates_by_title = {}
     for pair in pairs:
         try:
-            physical_index = pair['physical_index']
-            page_number = pair['page']
-            difference = physical_index - page_number
-            differences.append(difference)
-        except (KeyError, TypeError):
+            title = " ".join(str(pair['title']).casefold().split())
+            physical_index = int(pair['physical_index'])
+            page_number = int(pair['page'])
+        except (KeyError, TypeError, ValueError):
             continue
-    
-    if not differences:
-        return None
-    
+        if not title:
+            continue
+        candidates_by_title.setdefault(title, set()).add(
+            (page_number, physical_index)
+        )
+
+    independent = [
+        next(iter(matches))
+        for matches in candidates_by_title.values()
+        if len(matches) == 1
+    ]
+    differences = [physical - printed for printed, physical in independent]
     difference_counts = {}
     for diff in differences:
         difference_counts[diff] = difference_counts.get(diff, 0) + 1
-    
-    most_common = max(difference_counts.items(), key=lambda x: x[1])[0]
-    
-    return most_common
+    selected_offset = None
+    agreement_count = 0
+    if difference_counts:
+        selected_offset, agreement_count = min(
+            difference_counts.items(),
+            key=lambda item: (-item[1], abs(item[0]), item[0]),
+        )
+    match_count = len(independent)
+    agreement_ratio = agreement_count / match_count if match_count else 0.0
+    max_residual = (
+        max(abs(diff - selected_offset) for diff in differences)
+        if selected_offset is not None
+        else None
+    )
+    return {
+        "raw_match_count": len(pairs),
+        "independent_match_count": match_count,
+        "selected_offset": selected_offset,
+        "agreement_count": agreement_count,
+        "agreement_ratio": agreement_ratio,
+        "max_residual": max_residual,
+    }
+
+
+def calculate_page_offset(pairs):
+    metrics = page_offset_quality_metrics(pairs)
+    if metrics["independent_match_count"] < TOC_OFFSET_MIN_INDEPENDENT_MATCHES:
+        raise TocTransformationExhausted(
+            "toc_page_alignment", "insufficient_independent_matches"
+        )
+    if metrics["agreement_ratio"] < TOC_OFFSET_MIN_AGREEMENT_RATIO:
+        raise TocTransformationExhausted(
+            "toc_page_alignment", "offset_agreement_below_threshold"
+        )
+    if metrics["max_residual"] > TOC_OFFSET_MAX_RESIDUAL:
+        raise TocTransformationExhausted(
+            "toc_page_alignment", "offset_residual_above_threshold"
+        )
+    return metrics["selected_offset"]
 
 def add_page_offset_to_toc_json(data, offset):
     for i in range(len(data)):
@@ -481,11 +980,54 @@ def add_page_number_to_toc(part, structure, model=None):
     The given structure contains the result of the previous part, you need to fill the result of the current part, do not change the previous result.
     Directly return the final JSON structure. Do not output anything else."""
 
+    if len(structure) > PAGE_LOCATION_MAX_STRUCTURE_ENTRIES:
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "structure_chunk_entry_limit"
+        )
+    structure_chars = sum(
+        len(item.get("structure", "")) + len(item.get("title", "")) + 24
+        for item in structure
+    )
+    if structure_chars > PAGE_LOCATION_MAX_STRUCTURE_CHARS:
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "structure_chunk_character_limit"
+        )
+    if count_tokens(part, model) > PAGE_LOCATION_MAX_PAGE_GROUP_TOKENS:
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "page_group_token_limit"
+        )
+
     prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
-    current_json_raw = llm_completion(model=model, prompt=prompt)
+    current_json_raw, finish_reason = llm_completion(
+        model=model,
+        prompt=prompt,
+        return_finish_reason=True,
+        max_retries=PAGE_LOCATION_MAX_ATTEMPTS,
+        max_tokens=PAGE_LOCATION_MAX_OUTPUT_TOKENS,
+    )
+    if finish_reason != "finished":
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "provider_output_incomplete"
+        )
     json_result = extract_json(current_json_raw)
-    
-    for item in json_result:
+    if not isinstance(json_result, list) or len(json_result) != len(structure):
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "provider_output_shape_invalid"
+        )
+
+    for expected, item in zip(structure, json_result):
+        if not isinstance(item, dict):
+            raise TocTransformationExhausted(
+                "toc_page_mapping", "provider_output_item_invalid"
+            )
+        if (
+            item.get("structure") != expected.get("structure")
+            or " ".join(str(item.get("title") or "").split())
+            != expected.get("title")
+        ):
+            raise TocTransformationExhausted(
+                "toc_page_mapping", "provider_changed_structure"
+            )
         if 'start' in item:
             del item['start']
     return json_result
@@ -530,13 +1072,20 @@ def generate_toc_continue(toc_content, part, model=None):
         ]    
 
     Directly return the additional part of the final JSON structure. Do not output anything else."""
+    prompt += (
+        "\nUse a natural source heading when present. If no short heading exists, "
+        "synthesize a concise multilingual title instead of copying a body sentence. "
+        f"Every title must be at most {NO_TOC_MAX_TITLE_WORDS} words and "
+        f"{NO_TOC_MAX_TITLE_CHARS} characters."
+    )
 
     prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
     if finish_reason == 'finished':
         return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    raise TocTransformationExhausted(
+        "no_toc_generation", "provider_output_incomplete"
+    )
     
 ### add verify completeness
 def generate_toc_init(part, model=None):
@@ -564,14 +1113,21 @@ def generate_toc_init(part, model=None):
 
 
     Directly return the final JSON structure. Do not output anything else."""
+    prompt += (
+        "\nUse a natural source heading when present. If no short heading exists, "
+        "synthesize a concise multilingual title instead of copying a body sentence. "
+        f"Every title must be at most {NO_TOC_MAX_TITLE_WORDS} words and "
+        f"{NO_TOC_MAX_TITLE_CHARS} characters."
+    )
 
     prompt = prompt + '\nGiven text\n:' + part
     response, finish_reason = llm_completion(model=model, prompt=prompt, return_finish_reason=True)
 
     if finish_reason == 'finished':
          return extract_json(response)
-    else:
-        raise Exception(f'finish reason: {finish_reason}')
+    raise TocTransformationExhausted(
+        "no_toc_generation", "provider_output_incomplete"
+    )
 
 def process_no_toc(page_list, start_index=1, model=None, logger=None):
     page_contents=[]
@@ -594,33 +1150,95 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
 
     return toc_with_page_number
 
-def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
+def _map_structural_toc_to_pages(
+    toc_items,
+    page_list,
+    *,
+    start_index=1,
+    model=None,
+    logger=None,
+):
     page_contents=[]
     token_lengths=[]
-    toc_content = toc_transformer(toc_content, model)
-    logger.info(f'toc_transformer: {toc_content}')
     for page_index in range(start_index, start_index+len(page_list)):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
         page_contents.append(page_text)
         token_lengths.append(count_tokens(page_text, model))
-    
-    group_texts = page_list_to_group_text(page_contents, token_lengths)
+    group_texts = page_list_to_group_text(
+        page_contents,
+        token_lengths,
+        max_tokens=PAGE_LOCATION_MAX_PAGE_GROUP_TOKENS,
+    )
+    if len(group_texts) > PAGE_LOCATION_MAX_PAGE_GROUPS:
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "page_group_count_limit"
+        )
     logger.info(f'len(group_texts): {len(group_texts)}')
 
-    toc_with_page_number=copy.deepcopy(toc_content)
-    for group_text in group_texts:
-        toc_with_page_number = add_page_number_to_toc(group_text, toc_with_page_number, model)
-    logger.info(f'add_page_number_to_toc: {toc_with_page_number}')
+    mapped_items = []
+    for chunk in _chunk_numbered_toc(toc_items):
+        mapped_chunk = copy.deepcopy(chunk)
+        for group_text in group_texts:
+            mapped_chunk = add_page_number_to_toc(
+                group_text,
+                mapped_chunk,
+                model,
+            )
+        mapped_items.extend(mapped_chunk)
 
-    toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
-    logger.info(f'convert_physical_index_to_int: {toc_with_page_number}')
+    mapped_items = convert_physical_index_to_int(mapped_items)
+    if any(item.get("physical_index") is None for item in mapped_items):
+        raise TocTransformationExhausted(
+            "toc_page_mapping", "incomplete_tree_coverage"
+        )
+    return _validate_toc_sequence(
+        mapped_items,
+        page_field="physical_index",
+        require_pages=True,
+        min_page=start_index,
+        max_page=start_index + len(page_list) - 1,
+    )
 
-    return toc_with_page_number
+
+def process_toc_no_page_numbers(
+    toc_content,
+    toc_page_list,
+    page_list,
+    start_index=1,
+    model=None,
+    logger=None,
+    toc_applicability=TOC_APPLICABILITY_STRUCTURAL_NUMBERED,
+):
+    if toc_applicability == TOC_APPLICABILITY_STRUCTURAL_NUMBERED:
+        toc_items, metrics, chunks = _transform_structural_numbered_toc(
+            toc_content
+        )
+        logger.info({
+            "mode": "deterministic_structural_toc",
+            "entry_count": len(toc_items),
+            "chunk_count": len(chunks),
+            "coverage_ratio": metrics["coverage_ratio"],
+        })
+        return _map_structural_toc_to_pages(
+            toc_items,
+            page_list,
+            start_index=start_index,
+            model=model,
+            logger=logger,
+        )
+
+    raise TocTransformationExhausted(
+        "toc_policy", "unsupported_no_page_toc_applicability"
+    )
 
 
 
 def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
-    toc_with_page_number = toc_transformer(toc_content, model)
+    toc_with_page_number = toc_transformer(
+        toc_content,
+        model,
+        trusted_page_index=True,
+    )
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
     toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
@@ -753,7 +1371,10 @@ async def single_toc_item_index_fixer(section_title, content, model=None):
     prompt = toc_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
     response = await llm_acompletion(model=model, prompt=prompt)
     json_content = extract_json(response)    
-    return convert_physical_index_to_int(json_content['physical_index'])
+    physical_index = json_content.get('physical_index')
+    if physical_index is None:
+        return None
+    return convert_physical_index_to_int(physical_index)
 
 
 
@@ -956,19 +1577,69 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
 
 
 ################### main process #########################################################
-async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
+async def meta_processor(
+    page_list,
+    mode=None,
+    toc_content=None,
+    toc_page_list=None,
+    start_index=1,
+    opt=None,
+    logger=None,
+    toc_applicability=TOC_APPLICABILITY_NONE,
+):
     print(mode)
     print(f'start_index: {start_index}')
-    
+
+    if (
+        mode == 'process_toc_with_page_numbers'
+        and toc_applicability != TOC_APPLICABILITY_PRINTED_NUMBERED
+    ):
+        raise TocTransformationExhausted(
+            "toc_policy", "numbered_mode_requires_numbered_applicability"
+        )
+    if mode == 'process_toc_no_page_numbers' and toc_applicability not in {
+        TOC_APPLICABILITY_STRUCTURAL_NUMBERED,
+    }:
+        raise TocTransformationExhausted(
+            "toc_policy", "toc_mode_requires_explicit_applicability"
+        )
+    if mode == 'process_no_toc' and toc_applicability not in {
+        TOC_APPLICABILITY_UNUSABLE_CANDIDATE,
+        TOC_APPLICABILITY_NONE,
+    }:
+        raise TocTransformationExhausted(
+            "toc_policy", "no_toc_requires_generated_applicability"
+        )
+
     if mode == 'process_toc_with_page_numbers':
         toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger)
     elif mode == 'process_toc_no_page_numbers':
-        toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
+        toc_with_page_number = process_toc_no_page_numbers(
+            toc_content,
+            toc_page_list,
+            page_list,
+            start_index=start_index,
+            model=opt.model,
+            logger=logger,
+            toc_applicability=toc_applicability,
+        )
     else:
         toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
             
-    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None] 
-    
+    if mode == 'process_no_toc':
+        toc_with_page_number = _validate_generated_no_toc_candidate(
+            toc_with_page_number,
+            start_index=start_index,
+            page_count=len(page_list),
+        )
+    else:
+        toc_with_page_number = _validate_toc_sequence(
+            convert_physical_index_to_int(toc_with_page_number),
+            page_field="physical_index",
+            require_pages=True,
+            min_page=start_index,
+            max_page=start_index + len(page_list) - 1,
+        )
     toc_with_page_number = validate_and_truncate_physical_indices(
         toc_with_page_number, 
         len(page_list), 
@@ -979,22 +1650,61 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
     accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
         
     logger.info({
-        'mode': 'process_toc_with_page_numbers',
+        'mode': mode,
         'accuracy': accuracy,
         'incorrect_results': incorrect_results
     })
     if accuracy == 1.0 and len(incorrect_results) == 0:
-        return toc_with_page_number
+        if mode == 'process_no_toc':
+            return _validate_generated_no_toc_candidate(
+                toc_with_page_number,
+                start_index=start_index,
+                page_count=len(page_list),
+            )
+        return _validate_toc_sequence(
+            toc_with_page_number,
+            page_field="physical_index",
+            require_pages=True,
+            min_page=start_index,
+            max_page=start_index + len(page_list) - 1,
+        )
     if accuracy > 0.6 and len(incorrect_results) > 0:
         toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results,start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
-        return toc_with_page_number
-    else:
-        if mode == 'process_toc_with_page_numbers':
-            return await meta_processor(page_list, mode='process_toc_no_page_numbers', toc_content=toc_content, toc_page_list=toc_page_list, start_index=start_index, opt=opt, logger=logger)
-        elif mode == 'process_toc_no_page_numbers':
-            return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
+        if mode == 'process_no_toc':
+            toc_with_page_number = _validate_generated_no_toc_candidate(
+                toc_with_page_number,
+                start_index=start_index,
+                page_count=len(page_list),
+            )
         else:
-            raise Exception('Processing failed')
+            toc_with_page_number = _validate_toc_sequence(
+                convert_physical_index_to_int(toc_with_page_number),
+                page_field="physical_index",
+                require_pages=True,
+                min_page=start_index,
+                max_page=start_index + len(page_list) - 1,
+            )
+        accuracy, incorrect_results = await verify_toc(
+            page_list,
+            toc_with_page_number,
+            start_index=start_index,
+            model=opt.model,
+        )
+        if accuracy == 1.0 and len(incorrect_results) == 0:
+            if mode == 'process_no_toc':
+                return _validate_generated_no_toc_candidate(
+                    toc_with_page_number,
+                    start_index=start_index,
+                    page_count=len(page_list),
+                )
+            return _validate_toc_sequence(
+                toc_with_page_number,
+                page_field="physical_index",
+                require_pages=True,
+                min_page=start_index,
+                max_page=start_index + len(page_list) - 1,
+            )
+    raise TocTransformationExhausted("toc_quality", "whole_tree_verification_failed")
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
@@ -1030,7 +1740,15 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     check_toc_result = check_toc(page_list, opt)
     logger.info(check_toc_result)
 
-    if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":
+    toc_applicability, candidate_metrics = classify_toc_candidate(
+        check_toc_result.get("toc_content"),
+        check_toc_result.get("page_index_given_in_toc", "no"),
+    )
+    logger.info({
+        "toc_applicability": toc_applicability,
+        "candidate_metrics": candidate_metrics,
+    })
+    if toc_applicability == TOC_APPLICABILITY_PRINTED_NUMBERED:
         toc_with_page_number = await meta_processor(
             page_list, 
             mode='process_toc_with_page_numbers', 
@@ -1038,14 +1756,42 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
             toc_content=check_toc_result['toc_content'], 
             toc_page_list=check_toc_result['toc_page_list'], 
             opt=opt,
-            logger=logger)
+            logger=logger,
+            toc_applicability=toc_applicability)
+    elif toc_applicability == TOC_APPLICABILITY_STRUCTURAL_NUMBERED:
+        toc_with_page_number = await meta_processor(
+            page_list,
+            mode='process_toc_no_page_numbers',
+            start_index=1,
+            toc_content=check_toc_result['toc_content'],
+            toc_page_list=check_toc_result['toc_page_list'],
+            opt=opt,
+            logger=logger,
+            toc_applicability=toc_applicability,
+        )
+    elif toc_applicability == TOC_APPLICABILITY_UNUSABLE_CANDIDATE:
+        logger.info({
+            'mode': 'process_no_toc',
+            'reason': 'explicit_final_degradation_after_candidate_quality_rejection',
+            'toc_applicability': toc_applicability,
+            'candidate_metrics': candidate_metrics,
+        })
+        toc_with_page_number = await meta_processor(
+            page_list,
+            mode='process_no_toc',
+            start_index=1,
+            opt=opt,
+            logger=logger,
+            toc_applicability=toc_applicability,
+        )
     else:
         toc_with_page_number = await meta_processor(
             page_list, 
             mode='process_no_toc', 
             start_index=1, 
             opt=opt,
-            logger=logger)
+            logger=logger,
+            toc_applicability=TOC_APPLICABILITY_NONE)
 
     toc_with_page_number = add_preface_if_needed(toc_with_page_number)
     toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
@@ -1059,8 +1805,11 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
         for node in toc_tree
     ]
     await asyncio.gather(*tasks)
-    
-    return toc_tree
+    return _validate_published_tree_shape(
+        toc_tree,
+        start_index=1,
+        page_count=len(page_list),
+    )
 
 
 def page_index_main(doc, opt=None):
