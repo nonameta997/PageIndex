@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +25,7 @@ from pageindex.page_index import (
     _map_structural_toc_to_pages,
     _numbered_toc_entries,
     _transform_structural_numbered_toc,
+    _validate_printed_mapping_output,
     _validate_generated_no_toc_candidate,
     _validate_numbered_toc_chunk,
     _validate_toc_sequence,
@@ -33,11 +36,18 @@ from pageindex.page_index import (
     meta_processor,
     page_offset_quality_metrics,
     process_toc_no_page_numbers,
+    process_toc_with_page_numbers,
     toc_detector_single_page,
     toc_transformer,
     tree_parser,
 )
-from pageindex.toc_preflight import analyze_toc_candidate
+from pageindex.toc_preflight import (
+    FRESH_SCAN_EVIDENCE_MODE,
+    HISTORICAL_EVIDENCE_MODE,
+    analyze_pdf_bytes,
+    analyze_toc_candidate,
+    replay_sanitized_historical_records,
+)
 
 
 def _long_numbered_toc():
@@ -106,6 +116,46 @@ def test_printed_page_parser_requires_explicit_column_evidence():
         {"structure": "2", "title": "Tab column", "page": 2},
         {"structure": "3", "title": "Colon", "page": 3},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "toc_content",
+    [
+        "\n".join(
+            f"{index} Printed section {index} .... {index}"
+            for index in range(1, NUMBERED_TOC_AGGREGATE_MAX_ENTRIES + 2)
+        ),
+        _structural_toc(NUMBERED_TOC_AGGREGATE_MAX_ENTRIES + 1),
+    ],
+    ids=["printed", "structural"],
+)
+async def test_tree_parser_propagates_candidate_resource_exhaustion(toc_content):
+    opt = SimpleNamespace(
+        model="test",
+        max_page_num_each_node=100,
+        max_token_num_each_node=100000,
+    )
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    with (
+        patch(
+            "pageindex.page_index.check_toc",
+            return_value={
+                "toc_content": toc_content,
+                "toc_page_list": [0],
+                "page_index_given_in_toc": "yes",
+            },
+        ),
+        patch("pageindex.page_index.meta_processor") as processor,
+        patch("pageindex.page_index.process_no_toc") as no_toc,
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        await tree_parser([("body", 1)], opt, logger=logger)
+
+    assert caught.value.stage == "toc_chunk"
+    assert caught.value.reason_code == "aggregate_entry_limit"
+    processor.assert_not_called()
+    no_toc.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -302,14 +352,15 @@ def test_four_state_candidate_quality_matrix_is_deterministic():
     assert structural == TOC_APPLICABILITY_STRUCTURAL_NUMBERED
     assert structural_metrics["structural_entry_count"] == STRUCTURAL_TOC_MIN_ENTRIES
     assert unusable == TOC_APPLICABILITY_UNUSABLE_CANDIDATE
-    assert unusable_metrics == {
-        "source_line_count": 4,
-        "printed_entry_count": 0,
-        "structural_entry_count": 2,
-        "structural_coverage_ratio": 0.75,
-        "reported_page_index": True,
-        "candidate_rejection_reason": "insufficient_structural_entries",
-    }
+    assert unusable_metrics["candidate_present"] is True
+    assert unusable_metrics["source_line_count"] == 4
+    assert unusable_metrics["printed_entry_count"] == 0
+    assert unusable_metrics["structural_entry_count"] == 2
+    assert unusable_metrics["structural_coverage_ratio"] == 0.75
+    assert unusable_metrics["reported_page_index"] is True
+    assert unusable_metrics["candidate_rejection_reason"] == (
+        "insufficient_structural_entries"
+    )
     assert no_toc == TOC_APPLICABILITY_NONE
     assert no_toc_metrics["source_line_count"] == 0
 
@@ -337,6 +388,50 @@ def test_sanitized_preflight_selects_only_quality_gated_routes():
     assert printed["selected_route"] == "process_toc_with_page_numbers"
     assert structured["selected_route"] == "process_toc_no_page_numbers"
     assert no_toc["selected_route"] == "process_no_toc"
+
+
+def test_three_sanitized_historical_records_replay_same_policy_and_route():
+    fixture = Path(__file__).parent / "fixtures" / "long_toc_historical_preflight.json"
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+
+    result = replay_sanitized_historical_records(payload)
+
+    assert result["evidence_mode"] == HISTORICAL_EVIDENCE_MODE
+    assert result["source_object"] == {
+        "object_sha256_prefix": "9a20c8e616d444e3",
+        "object_size": 2379606,
+        "page_count": 74,
+    }
+    assert result["artifact_count"] == 3
+    assert result["stable_identical_classification"] is True
+    assert result["stable_identical_route"] is True
+    assert {
+        item["toc_applicability"] for item in result["artifacts"]
+    } == {TOC_APPLICABILITY_UNUSABLE_CANDIDATE}
+    assert {item["selected_route"] for item in result["artifacts"]} == {
+        "process_no_toc"
+    }
+    serialized = json.dumps(result, sort_keys=True)
+    assert "toc_content" not in serialized
+    assert "title\"" not in serialized
+
+
+def test_fresh_pdf_scan_is_explicitly_distinct_from_historical_replay():
+    class Page:
+        def extract_text(self):
+            return "Detector-like body\n1 Sparse marker\ncontinued body"
+
+    class Reader:
+        def __init__(self, _stream):
+            self.pages = [Page(), Page()]
+
+    with patch("pageindex.toc_preflight.PdfReader", Reader):
+        result = analyze_pdf_bytes(b"provider-free synthetic PDF bytes")
+
+    assert result["evidence_mode"] == FRESH_SCAN_EVIDENCE_MODE
+    assert result["historical_detector_selection_replayed"] is False
+    assert result["toc_page_list"] == []
+    assert result["toc_applicability"] == TOC_APPLICABILITY_NONE
 
 
 @pytest.mark.asyncio
@@ -566,6 +661,82 @@ def test_page_mapping_malformed_or_truncated_provider_output_fails_typed(
         )
     assert caught.value.stage == "toc_page_mapping"
     assert caught.value.reason_code == reason
+
+
+@pytest.mark.parametrize(
+    ("provider_output", "reason"),
+    [
+        (None, "provider_output_shape_invalid"),
+        ({"structure": "1"}, "provider_output_shape_invalid"),
+        ("not a mapping list", "provider_output_shape_invalid"),
+        ([None], "provider_output_item_invalid"),
+        (
+            [{"structure": "1", "title": None, "physical_index": 2}],
+            "provider_output_title_invalid",
+        ),
+        (
+            [{"structure": "1", "title": "One", "physical_index": None}],
+            "provider_physical_index_invalid",
+        ),
+        (
+            [
+                {
+                    "structure": "1",
+                    "title": "One",
+                    "physical_index": "<physical_index_99>",
+                }
+            ],
+            "provider_physical_index_out_of_bounds",
+        ),
+    ],
+)
+def test_printed_page_mapping_rejects_malformed_provider_output_before_use(
+    provider_output,
+    reason,
+):
+    logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+    expected = [{"structure": "1", "title": "One", "page": 1}]
+    with (
+        patch("pageindex.page_index.toc_transformer", return_value=expected),
+        patch(
+            "pageindex.page_index.toc_index_extractor",
+            return_value=provider_output,
+        ),
+        patch(
+            "pageindex.page_index.extract_matching_page_pairs",
+            side_effect=AssertionError("malformed output reached dictionary consumer"),
+        ),
+        pytest.raises(TocTransformationExhausted) as caught,
+    ):
+        process_toc_with_page_numbers(
+            "1 One .... 1",
+            [0],
+            [("toc", 1), ("body", 1), ("body", 1)],
+            toc_check_page_num=2,
+            model="test",
+            logger=logger,
+        )
+
+    assert caught.value.stage == "toc_page_alignment"
+    assert caught.value.reason_code == reason
+
+
+def test_printed_mapping_validator_accepts_only_expected_bounded_entries():
+    mapped = _validate_printed_mapping_output(
+        [
+            {
+                "structure": "1",
+                "title": "One",
+                "physical_index": "<physical_index_2>",
+            }
+        ],
+        [{"structure": "1", "title": "One", "page": 1}],
+        min_page=2,
+        max_page=3,
+    )
+    assert mapped == [
+        {"structure": "1", "title": "One", "physical_index": 2}
+    ]
 
 
 def test_valid_multilingual_generated_tree_satisfies_publication_quality():

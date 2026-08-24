@@ -203,24 +203,94 @@ def _numbered_toc_entries(toc_content):
     return entries
 
 
+def _candidate_structure_metrics(entries):
+    seen = set()
+    previous = None
+    unique = True
+    source_order = True
+    hierarchy = True
+    for item in entries:
+        structure = item["structure"]
+        key = tuple(int(part) for part in structure.split("."))
+        if structure in seen:
+            unique = False
+        if previous is not None and key <= previous:
+            source_order = False
+        if len(key) > 1:
+            parent = ".".join(str(part) for part in key[:-1])
+            if parent not in seen:
+                hierarchy = False
+        seen.add(structure)
+        previous = key
+    return {
+        "unique_structures": unique,
+        "source_order_valid": source_order,
+        "hierarchy_valid": hierarchy,
+    }
+
+
+def classify_toc_candidate_metrics(metrics):
+    """Classify sanitized candidate metrics without requiring source text."""
+    if not metrics.get("candidate_present"):
+        return TOC_APPLICABILITY_NONE
+
+    resource_stage = metrics.get("resource_exhaustion_stage")
+    resource_reason = metrics.get("resource_exhaustion_reason")
+    if resource_stage or resource_reason:
+        raise TocTransformationExhausted(
+            resource_stage or "toc_chunk",
+            resource_reason or "resource_limit",
+        )
+
+    if (
+        metrics.get("printed_entry_count", 0) > 0
+        and metrics.get("printed_sequence_valid") is True
+    ):
+        return TOC_APPLICABILITY_PRINTED_NUMBERED
+
+    if (
+        metrics.get("structural_entry_count", 0) >= STRUCTURAL_TOC_MIN_ENTRIES
+        and metrics.get("structural_coverage_ratio", 0.0)
+        >= STRUCTURAL_TOC_MIN_COVERAGE_RATIO
+        and metrics.get("unique_structures") is True
+        and metrics.get("source_order_valid") is True
+        and metrics.get("hierarchy_valid") is True
+        and metrics.get("structural_sequence_valid") is True
+    ):
+        return TOC_APPLICABILITY_STRUCTURAL_NUMBERED
+
+    return TOC_APPLICABILITY_UNUSABLE_CANDIDATE
+
+
 def classify_toc_candidate(toc_content, page_index_given_in_toc="no"):
     """Classify provider-detected text using deterministic, sanitized gates."""
     content = str(toc_content or "")
     if not content.strip():
-        return TOC_APPLICABILITY_NONE, {
+        metrics = {
+            "candidate_present": False,
             "source_line_count": 0,
             "printed_entry_count": 0,
+            "printed_sequence_valid": False,
             "structural_entry_count": 0,
             "structural_coverage_ratio": 0.0,
+            "structural_sequence_valid": False,
+            "unique_structures": True,
+            "source_order_valid": True,
+            "hierarchy_valid": True,
             "candidate_rejection_reason": None,
         }
+        return classify_toc_candidate_metrics(metrics), metrics
 
     structural_entries, structural_metrics = _structural_toc_entries(content)
     metrics = {
+        "candidate_present": True,
         "source_line_count": structural_metrics["source_line_count"],
         "printed_entry_count": 0,
+        "printed_sequence_valid": False,
         "structural_entry_count": len(structural_entries),
         "structural_coverage_ratio": structural_metrics["coverage_ratio"],
+        "structural_sequence_valid": False,
+        **_candidate_structure_metrics(structural_entries),
         "reported_page_index": page_index_given_in_toc == "yes",
         "candidate_rejection_reason": None,
     }
@@ -231,21 +301,27 @@ def classify_toc_candidate(toc_content, page_index_given_in_toc="no"):
         try:
             _merge_numbered_toc_chunks(_chunk_numbered_toc(printed_entries))
         except TocTransformationExhausted as exc:
+            if exc.stage == "toc_chunk":
+                raise
             metrics["candidate_rejection_reason"] = exc.reason_code
         else:
-            return TOC_APPLICABILITY_PRINTED_NUMBERED, metrics
+            metrics["printed_sequence_valid"] = True
+            return classify_toc_candidate_metrics(metrics), metrics
 
     if _has_numbered_toc_structure(content):
         try:
             _transform_structural_numbered_toc(content)
         except TocTransformationExhausted as exc:
+            if exc.stage == "toc_chunk":
+                raise
             metrics["candidate_rejection_reason"] = exc.reason_code
         else:
-            return TOC_APPLICABILITY_STRUCTURAL_NUMBERED, metrics
+            metrics["structural_sequence_valid"] = True
+            return classify_toc_candidate_metrics(metrics), metrics
 
     if metrics["candidate_rejection_reason"] is None:
         metrics["candidate_rejection_reason"] = "no_usable_numbered_structure"
-    return TOC_APPLICABILITY_UNUSABLE_CANDIDATE, metrics
+    return classify_toc_candidate_metrics(metrics), metrics
 
 
 def classify_toc_applicability(toc_content, page_index_given_in_toc="no"):
@@ -833,6 +909,83 @@ def remove_page_number(data):
             remove_page_number(item)
     return data
 
+
+def _validate_printed_mapping_output(
+    value,
+    expected_items,
+    *,
+    min_page,
+    max_page,
+):
+    """Validate the printed-TOC locator response before downstream dictionary use."""
+    if not isinstance(value, list):
+        raise TocTransformationExhausted(
+            "toc_page_alignment", "provider_output_shape_invalid"
+        )
+    if not value:
+        raise TocTransformationExhausted(
+            "toc_page_alignment", "provider_output_empty"
+        )
+
+    expected = {
+        (item["structure"], item["title"])
+        for item in expected_items
+    }
+    seen = set()
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_output_item_invalid"
+            )
+
+        structure = item.get("structure")
+        title = item.get("title")
+        if not isinstance(structure, str) or not structure.strip():
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_output_structure_invalid"
+            )
+        if not isinstance(title, str) or not title.strip():
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_output_title_invalid"
+            )
+        key = (structure.strip(), title.strip())
+        if key not in expected:
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_changed_structure"
+            )
+        if key in seen:
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_output_duplicate"
+            )
+
+        physical_index = item.get("physical_index")
+        if isinstance(physical_index, str):
+            tag = re.fullmatch(r"<physical_index_(\d+)>", physical_index.strip())
+            if tag:
+                physical_index = int(tag.group(1))
+            elif physical_index.strip().isdigit():
+                physical_index = int(physical_index.strip())
+        if not isinstance(physical_index, int) or isinstance(physical_index, bool):
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_physical_index_invalid"
+            )
+        if physical_index < min_page or physical_index > max_page:
+            raise TocTransformationExhausted(
+                "toc_page_alignment", "provider_physical_index_out_of_bounds"
+            )
+
+        normalized.append(
+            {
+                "structure": key[0],
+                "title": key[1],
+                "physical_index": physical_index,
+            }
+        )
+        seen.add(key)
+    return normalized
+
+
 def extract_matching_page_pairs(toc_page, toc_physical_index, start_page_index):
     pairs = []
     for phy_item in toc_physical_index:
@@ -1245,14 +1398,21 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
     
     start_page_index = toc_page_list[-1] + 1
     main_content = ""
-    for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
+    end_page_index = min(start_page_index + toc_check_page_num, len(page_list))
+    for page_index in range(start_page_index, end_page_index):
         main_content += f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
 
     toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model)
-    logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
-
-    toc_with_physical_index = convert_physical_index_to_int(toc_with_physical_index)
-    logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
+    toc_with_physical_index = _validate_printed_mapping_output(
+        toc_with_physical_index,
+        toc_no_page_number,
+        min_page=start_page_index + 1,
+        max_page=end_page_index,
+    )
+    logger.info({
+        "mode": "printed_toc_page_alignment",
+        "mapped_entry_count": len(toc_with_physical_index),
+    })
 
     matching_pairs = extract_matching_page_pairs(toc_with_page_number, toc_with_physical_index, start_page_index)
     logger.info(f'matching_pairs: {matching_pairs}')
